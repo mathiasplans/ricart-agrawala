@@ -7,9 +7,22 @@ from functools import wraps
 import random
 import sys
 import _thread
+import asyncio
 
 N = int(sys.argv[1])
 others = []
+
+p_upper = 5
+cs_upper = 10
+
+def parallel(f):
+    def wrapped(*args, **kwargs):
+        return asyncio.get_event_loop().run_in_executor(None, f, *args, **kwargs)
+
+    return wrapped
+
+def CS():
+    time.sleep(random.uniform(10, cs_upper))
 
 class Serv(rpyc.Service):
     other_lamport = 0
@@ -27,6 +40,8 @@ class Serv(rpyc.Service):
     def exposed_get_lamport(self):
         return self.p.get_time()
 
+    # Ask for permission to use CS
+    # returning means giving permission
     def exposed_ask_cs(self):
         while True:
             if self.p.state == "DO-NOT-WANT":
@@ -39,6 +54,8 @@ class Serv(rpyc.Service):
                 self_is_greater_id = self.p.id > self.other_id
                 self_ts_is_greater = self.p.wanted_ts > self.other_lamport
                 ts_is_equal = self.p.wanted_ts == self.other_lamport
+
+                # Conflicts are resolved by prioritizing higher ID processes
                 if self_ts_is_greater or (ts_is_equal and not self_is_greater_id):
                     return
 
@@ -51,11 +68,11 @@ class Process:
         self.lamport = 0
         self.state = "DO-NOT-WANT"
         self.wanted_ts = 0
+        self.lock = _thread.allocate_lock()
+        self.loop = None
 
         partialserv = classpartial(Serv, self);
         self.ts = ThreadedServer(partialserv, port=port)
-
-        self.lock = _thread.allocate_lock()
 
     def increment_time(self):
         with self.lock:
@@ -85,20 +102,48 @@ class Process:
     def get_cs(self):
         self.wanted_ts = self.increment_time()
 
-        # Ask permission from others
-        # if this loop terminates then all the permissions were given
-        for p in others:
+        # This has to be done in parallel because
+        # otherwise higher ID tasks get the resource
+        # more often than lower ID tasks. Basically
+        # some tasks will block this so higher ID
+        # tasks will not get polled, so the timestamp
+        # is not propagated and the asking timestamp
+        # will be therefore lower usually.
+        #
+        # This is fixed with doing it in parallel.
+        @parallel
+        def ask_permission(p):
             c = rpyc.connect("localhost", p)
-            c._config['sync_request_timeout'] = None # Turn of the timeout
+            c._config['sync_request_timeout'] = None # Turn off the timeout
             c.root.info(self.id, self.wanted_ts)
             c.root.ask_cs()
+            c.close()
+
+        # Ask permission from others
+        awaitables = []
+        for p in others:
+            if p == self.port:
+                continue
+
+            awaitables.append(ask_permission(p))
+
+        # if this loop terminates then all the permissions were given
+        self.loop.run_until_complete(asyncio.gather(*awaitables))
 
     def run(self):
+        # Create an event loop for this thread
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+
+        # Add a random delay at the beginning
+        # for added realism
+        time.sleep(random.uniform(1.5, 6.5))
+
         # with 5 second interval, update clock
         while True:
             if self.state == "HELD":
-                time.sleep(10)
-                self.lamport += 1
+                CS()
+                self.increment_time()
                 self.state = "DO-NOT-WANT"
 
             elif self.state == "WANTED":
@@ -107,8 +152,8 @@ class Process:
                 pass
 
             elif self.state == "DO-NOT-WANT":
-                time.sleep(5)
-                self.lamport += 1
+                time.sleep(random.uniform(5, p_upper))
+                self.increment_time()
                 self.state = "WANTED"
 
 
@@ -135,14 +180,23 @@ if __name__=='__main__':
 
         command = cmd[0]
 
-        # handle exit
         if command == "Exit":
             running = False
 
-        # handle list
+        elif command == "time-cs":
+            newupper = int(cmd[1])
+            if newupper >= 10:
+                cs_upper = newupper
+
+        elif command == "time-p":
+            newupper = int(cmd[1])
+            if newupper >= 5:
+                p_upper = newupper
+
         elif command == "List":
             try:
                 for p in processes:
-                    print(f"P{p.id}, {p.state}")
+                    debug = f"[{p.lamport}, {p.wanted_ts}]" if True else ""
+                    print(f"P{p.id}{debug}, {p.state}")
             except:
                 print("Error")
