@@ -196,7 +196,7 @@ if __name__=='__main__':
         elif command == "List":
             try:
                 for p in processes:
-                    debug = f"[{p.lamport}, {p.wanted_ts}]" if True else ""
+                    debug = f"[{p.lamport}, {p.wanted_ts}]" if False else ""
                     print(f"P{p.id}{debug}, {p.state}")
             except:
                 print("Error")
