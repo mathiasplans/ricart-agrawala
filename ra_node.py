@@ -13,10 +13,16 @@ others = []
 
 class Serv(rpyc.Service):
     other_lamport = 0
+    other_id = -1
 
     def __init__(self, p):
         self.p = p
         pass
+
+    def exposed_info(self, id, lamport):
+        self.other_lamport = lamport
+        self.other_id = id
+        self.p.max_time(self.other_lamport)
 
     def exposed_get_lamport(self):
         return self.p.get_time()
@@ -30,16 +36,13 @@ class Serv(rpyc.Service):
                 pass
 
             elif self.p.state == "WANTED":
-                if self.p.get_time() > self.other_lamport:
+                self_is_greater_id = self.p.id > self.other_id
+                self_ts_is_greater = self.p.wanted_ts > self.other_lamport
+                ts_is_equal = self.p.wanted_ts == self.other_lamport
+                if self_ts_is_greater or (ts_is_equal and not self_is_greater_id):
                     return
 
             time.sleep(0.2)
-
-    def on_connect(self, conn):
-        # Time management
-        self.other_lamport = conn.root.get_lamport()
-        self.p.max_time(self.other_lamport)
-
 
 class Process:
     def __init__(self, id, port):
@@ -55,35 +58,40 @@ class Process:
         self.lock = _thread.allocate_lock()
 
     def increment_time(self):
-        with lock:
+        with self.lock:
             self.lamport += 1
             return self.lamport
 
     def max_time(self, other):
-        with lock:
+        with self.lock:
             self.lamport += 1
             self.lamport = max(self.lamport, other)
             return self.lamport
 
     def get_time(self):
-        with lock:
+        with self.lock:
             return self.lamport
 
     def get_state(self):
         return self.state
 
+    def rpyc_start(self):
+        self.ts.start()
+
     def start(self):
+        _thread.start_new_thread(self.rpyc_start, ())
         _thread.start_new_thread(self.run, ())
 
     def get_cs(self):
-        self.wanted_ts = self.get_time()
+        self.wanted_ts = self.increment_time()
 
         # Ask permission from others
         # if this loop terminates then all the permissions were given
         for p in others:
-            self.increment_time()
-            rpyc.connect("localhost", p)
-            p.root.ask_cs()
+            c = rpyc.connect("localhost", p)
+            c._config['sync_request_timeout'] = None # Turn of the timeout
+            c.root.info(self.id, self.wanted_ts)
+            c.root.ask_cs()
 
     def run(self):
         # with 5 second interval, update clock
@@ -94,7 +102,7 @@ class Process:
                 self.state = "DO-NOT-WANT"
 
             elif self.state == "WANTED":
-                try_cs()
+                self.get_cs()
                 self.state = "HELD"
                 pass
 
@@ -123,18 +131,18 @@ if __name__=='__main__':
     while running:
         command_string = input()
 
-        inp = command_string.lower()
-        cmd = inp.split(" ")
+        cmd = command_string.split(" ")
 
         command = cmd[0]
 
         # handle exit
-        elif command == "Exit":
+        if command == "Exit":
             running = False
 
         # handle list
         elif command == "List":
             try:
-                self.list()
+                for p in processes:
+                    print(f"P{p.id}, {p.state}")
             except:
                 print("Error")
